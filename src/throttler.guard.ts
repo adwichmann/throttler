@@ -10,6 +10,7 @@ import {
 } from './throttler-module-options.interface';
 import { ThrottlerStorage } from './throttler-storage.interface';
 import {
+  THROTTLER_BLOCK_DURATION,
   THROTTLER_KEY_GENERATOR,
   THROTTLER_LIMIT,
   THROTTLER_SKIP,
@@ -18,7 +19,7 @@ import {
 } from './throttler.constants';
 import { InjectThrottlerOptions, InjectThrottlerStorage } from './throttler.decorator';
 import { ThrottlerException, throttlerMessage } from './throttler.exception';
-import { ThrottlerLimitDetail } from './throttler.guard.interface';
+import { ThrottlerLimitDetail, ThrottlerRequest } from './throttler.guard.interface';
 
 /**
  * @publicApi
@@ -37,7 +38,6 @@ export class ThrottlerGuard implements CanActivate {
     @InjectThrottlerStorage() protected readonly storageService: ThrottlerStorage,
     protected readonly reflector: Reflector,
   ) {}
-
   async onModuleInit() {
     this.throttlers = (Array.isArray(this.options) ? this.options : this.options.throttlers)
       .sort((first, second) => {
@@ -63,7 +63,6 @@ export class ThrottlerGuard implements CanActivate {
     this.commonOptions.getTracker ??= this.getTracker.bind(this);
     this.commonOptions.generateKey ??= this.generateKey.bind(this);
   }
-
   /**
    * Throttle requests against their TTL limit and whether to allow or deny it.
    * Based on the context type different handlers will be called.
@@ -72,12 +71,10 @@ export class ThrottlerGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const handler = context.getHandler();
     const classRef = context.getClass();
-
     if (await this.shouldSkip(context)) {
       return true;
     }
     const continues: boolean[] = [];
-
     for (const namedThrottler of this.throttlers) {
       // Return early if the current route should be skipped.
       const skip = this.reflector.getAllAndOverride<boolean>(THROTTLER_SKIP + namedThrottler.name, [
@@ -89,7 +86,6 @@ export class ThrottlerGuard implements CanActivate {
         continues.push(true);
         continue;
       }
-
       // Return early when we have no limit or ttl data.
       const routeOrClassLimit = this.reflector.getAllAndOverride<Resolvable<number>>(
         THROTTLER_LIMIT + namedThrottler.name,
@@ -97,6 +93,10 @@ export class ThrottlerGuard implements CanActivate {
       );
       const routeOrClassTtl = this.reflector.getAllAndOverride<Resolvable<number>>(
         THROTTLER_TTL + namedThrottler.name,
+        [handler, classRef],
+      );
+      const routeOrClassBlockDuration = this.reflector.getAllAndOverride<Resolvable<number>>(
+        THROTTLER_BLOCK_DURATION + namedThrottler.name,
         [handler, classRef],
       );
       const routeOrClassGetTracker = this.reflector.getAllAndOverride<ThrottlerGetTrackerFunction>(
@@ -108,40 +108,43 @@ export class ThrottlerGuard implements CanActivate {
           THROTTLER_KEY_GENERATOR + namedThrottler.name,
           [handler, classRef],
         );
-
       // Check if specific limits are set at class or route level, otherwise use global options.
       const limit = await this.resolveValue(context, routeOrClassLimit || namedThrottler.limit);
       const ttl = await this.resolveValue(context, routeOrClassTtl || namedThrottler.ttl);
+      const blockDuration = await this.resolveValue(
+        context,
+        routeOrClassBlockDuration || namedThrottler.blockDuration || ttl,
+      );
       const getTracker =
         routeOrClassGetTracker || namedThrottler.getTracker || this.commonOptions.getTracker;
       const generateKey =
         routeOrClassGetKeyGenerator || namedThrottler.generateKey || this.commonOptions.generateKey;
-
       continues.push(
-        await this.handleRequest(context, limit, ttl, namedThrottler, getTracker, generateKey),
+        await this.handleRequest({
+          context,
+          limit,
+          ttl,
+          throttler: namedThrottler,
+          blockDuration,
+          getTracker,
+          generateKey,
+        }),
       );
     }
     return continues.every((cont) => cont);
   }
-
   protected async shouldSkip(_context: ExecutionContext): Promise<boolean> {
     return false;
   }
-
   /**
    * Throttles incoming HTTP requests.
    * All the outgoing requests will contain RFC-compatible RateLimit headers.
    * @see https://tools.ietf.org/id/draft-polli-ratelimit-headers-00.html#header-specifications
    * @throws {ThrottlerException}
    */
-  protected async handleRequest(
-    context: ExecutionContext,
-    limit: number,
-    ttl: number,
-    throttler: ThrottlerOptions,
-    getTracker: ThrottlerGetTrackerFunction,
-    generateKey: ThrottlerGenerateKeyFunction,
-  ): Promise<boolean> {
+  protected async handleRequest(requestProps: ThrottlerRequest): Promise<boolean> {
+    const { context, limit, ttl, throttler, blockDuration, getTracker, generateKey } = requestProps;
+
     // Here we start to check the amount of requests being done against the ttl.
     const { req, res } = this.getRequestResponse(context);
     const ignoreUserAgents = throttler.ignoreUserAgents ?? this.commonOptions.ignoreUserAgents;
@@ -155,13 +158,14 @@ export class ThrottlerGuard implements CanActivate {
     }
     const tracker = await getTracker(req);
     const key = generateKey(context, tracker, throttler.name);
-    const { totalHits, timeToExpire } = await this.storageService.increment(key, ttl);
+    const { totalHits, timeToExpire, isBlocked, timeToBlockExpire } =
+      await this.storageService.increment(key, ttl, limit, blockDuration, throttler.name);
 
     const getThrottlerSuffix = (name: string) => (name === 'default' ? '' : `-${name}`);
 
     // Throw an error when the user reached their limit.
-    if (totalHits > limit) {
-      res.header(`Retry-After${getThrottlerSuffix(throttler.name)}`, timeToExpire);
+    if (isBlocked) {
+      res.header(`Retry-After${getThrottlerSuffix(throttler.name)}`, timeToBlockExpire);
       await this.throwThrottlingException(context, {
         limit,
         ttl,
@@ -169,6 +173,8 @@ export class ThrottlerGuard implements CanActivate {
         tracker,
         totalHits,
         timeToExpire,
+        isBlocked,
+        timeToBlockExpire,
       });
     }
 
@@ -180,14 +186,11 @@ export class ThrottlerGuard implements CanActivate {
       Math.max(0, limit - totalHits),
     );
     res.header(`${this.headerPrefix}-Reset${getThrottlerSuffix(throttler.name)}`, timeToExpire);
-
     return true;
   }
-
   protected async getTracker(req: Record<string, any>): Promise<string> {
     return req.ip;
   }
-
   protected getRequestResponse(context: ExecutionContext): {
     req: Record<string, any>;
     res: Record<string, any>;
@@ -195,7 +198,6 @@ export class ThrottlerGuard implements CanActivate {
     const http = context.switchToHttp();
     return { req: http.getRequest(), res: http.getResponse() };
   }
-
   /**
    * Generate a hashed key that will be used as a storage key.
    * The key will always be a combination of the current context and IP.
@@ -204,7 +206,6 @@ export class ThrottlerGuard implements CanActivate {
     const prefix = `${context.getClass().name}-${context.getHandler().name}-${name}`;
     return md5(`${prefix}-${suffix}`);
   }
-
   /**
    * Throws an exception for the event that the rate limit has been exceeded.
    *
@@ -218,7 +219,6 @@ export class ThrottlerGuard implements CanActivate {
   ): Promise<void> {
     throw new ThrottlerException(await this.getErrorMessage(context, throttlerLimitDetail));
   }
-
   protected async getErrorMessage(
     _context: ExecutionContext,
     _throttlerLimitDetail: ThrottlerLimitDetail,
@@ -228,7 +228,6 @@ export class ThrottlerGuard implements CanActivate {
     }
     return this.errorMessage;
   }
-
   private async resolveValue<T extends number | string | boolean>(
     context: ExecutionContext,
     resolvableValue: Resolvable<T>,
